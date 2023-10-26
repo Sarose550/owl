@@ -27,6 +27,7 @@ import Unbound.Generics.LocallyNameless.Unsafe
 import Unbound.Generics.LocallyNameless.TH
 import System.FilePath ((</>), takeFileName)
 import System.IO
+import Pretty
 import Prettyprinter
 import Data.IORef
 
@@ -124,6 +125,13 @@ resolveDecls :: [Decl] -> Resolve [Decl]
 resolveDecls [] = return []
 resolveDecls (d:ds) = 
     case d^.val of
+      DeclFun s bp -> do
+          (b, a) <- unbind bp
+          a' <- resolveAExpr a
+          pth <- view curPath
+          ds' <- local (over funcPaths $ T.insert s pth) $ resolveDecls ds
+          let d' = Spanned (d^.spanOf) $ DeclFun s $ bind b a'
+          return (d' : ds')
       DeclPredicate s bp -> do
           ((ps, xs), p) <- unbind bp
           p' <- resolveProp p
@@ -149,11 +157,13 @@ resolveDecls (d:ds) =
                           nt' <- resolveNameType nt
                           ls' <- mapM (resolveLocality (d^.spanOf)) ls
                           return $ DeclBaseName nt' ls'
-                      DeclRO aes nts adm -> do
-                          aes' <- mapM resolveAExpr aes
+                      DeclRO strictness b -> do
+                          (xs, (a, req, nts, lem)) <- unbind b
+                          a' <- resolveAExpr a
+                          req' <- resolveProp req
                           nts' <- mapM resolveNameType nts
-                          adm' <- traverse resolveExpr adm
-                          return $ DeclRO aes' nts' adm' 
+                          lem' <- resolveExpr lem
+                          return $ DeclRO strictness $ bind xs (a', req', nts', lem')
           p <- view curPath
           let d' = Spanned (d^.spanOf) $ DeclName s $ bind is ndecl' 
           ds' <- local (over namePaths $ T.insert s p) $ resolveDecls ds
@@ -318,19 +328,19 @@ resolveTy e = do
         where
             go t = 
                 case t of
-                  TData l1 l2 -> do
+                  TData l1 l2 s -> do
                       l1' <- resolveLabel l1
                       l2' <- resolveLabel l2
-                      return $ TData l1' l2'
+                      return $ TData l1' l2' s
                   TDataWithLength l a -> do
                       l' <- resolveLabel l
                       a' <- resolveAExpr a
                       return $ TDataWithLength l' a'
-                  TRefined t xp -> do
+                  TRefined t s xp -> do
                       t' <- resolveTy t
                       (x, p) <- unbind xp
                       p' <- resolveProp p
-                      return $ TRefined t' $ bind x p'
+                      return $ TRefined t' s $ bind x p'
                   TOption t -> TOption <$> resolveTy t
                   TConst p fs -> do
                       fs' <- mapM resolveFuncParam fs
@@ -361,7 +371,12 @@ resolveNameExp ne =
     case ne^.val of
         NameConst s p oi -> do
             p' <- resolvePath (ne^.spanOf) PTName p
-            return $ Spanned (ne^.spanOf) $ NameConst s p' oi
+            oi' <- case oi of
+                     Nothing -> return Nothing
+                     Just (as, i) -> do
+                         as' <- mapM resolveAExpr as
+                         return $ Just (as', i)
+            return $ Spanned (ne^.spanOf) $ NameConst s p' oi'
         PRFName ne1 s -> do
             ne1' <- resolveNameExp ne1
             return $ Spanned (ne^.spanOf) $ PRFName ne1' s
@@ -379,7 +394,7 @@ resolveFuncParam f =
 
 resolvePath pos pt p = do
     p' <- resolvePath' pos pt p
-    debug $ pretty "Resolved " <> pretty p <> pretty " to " <> pretty p'
+    debug $ owlpretty "Resolved " <> owlpretty p <> owlpretty " to " <> owlpretty p'
     return p'
 
 resolvePath' :: Ignore Position -> PathType -> Path -> Resolve Path
@@ -387,7 +402,7 @@ resolvePath' pos pt p =
     case p of
       PRes _ -> return p
       PUnresolvedPath x xs -> do
-          debug $ pretty "Resolving " <> pretty p
+          debug $ owlpretty "Resolving " <> owlpretty p
           mp <- view modPaths
           res <- case lookup x mp of
                   Just (b, p) -> do
@@ -444,6 +459,7 @@ resolveLabel l =
           return $ Spanned (l^.spanOf) $ LName ne'
       LZero -> return l
       LAdv -> return l
+      LTop -> return l
       LJoin l1 l2 -> do
           l1' <- resolveLabel l1
           l2' <- resolveLabel l2
@@ -466,9 +482,10 @@ resolveAExpr a =
           as' <- mapM resolveAExpr as
           return $ Spanned (a^.spanOf) $ AEApp f' ps' as'
       AEHex _ -> return a
-      AEPreimage p ps -> do
+      AEPreimage p ps as -> do
           p' <- resolvePath (a^.spanOf) PTName p
-          return $ Spanned (a^.spanOf) $ AEPreimage p' ps
+          as' <- mapM resolveAExpr as
+          return $ Spanned (a^.spanOf) $ AEPreimage p' ps as'
       AEGet ne -> do
           ne' <- resolveNameExp ne
           return $ Spanned (a^.spanOf) $ AEGet ne'
@@ -484,23 +501,31 @@ resolveAExpr a =
       AELenConst _ -> return a
       AEInt _ -> return a
 
+resolveLemma :: Ignore Position -> BuiltinLemma -> Resolve BuiltinLemma
+resolveLemma pos lem =
+    case lem of
+      LemmaCRH -> return lem
+      LemmaConstant -> return lem
+      LemmaDisjNotEq -> return lem
+      LemmaCrossDH n1 n2 n3 -> do
+          n1' <- resolveNameExp n1
+          n2' <- resolveNameExp n2
+          n3' <- resolveNameExp n3
+          return $ LemmaCrossDH n1' n2' n3'
+
+
 resolveCryptOp :: Ignore Position -> CryptOp -> Resolve CryptOp
 resolveCryptOp pos cop = 
     case cop of
-      CConstantLemma x -> do
-          x' <- resolveAExpr x
-          return $ CConstantLemma x'
-      CDisjNotEq x y -> do
-          x' <- resolveAExpr x
-          y' <- resolveAExpr y
-          return $ CDisjNotEq x' y'
-      CCRHLemma x y -> do
-          x' <- resolveAExpr x
-          y' <- resolveAExpr y
-          return $ CCRHLemma x' y'
-      CHash p is i -> do
-          p' <- resolvePath pos PTName p
-          return $ CHash p' is i
+      CLemma l -> do
+          l' <- resolveLemma pos l
+          return $ CLemma l'
+      CHash hints i -> do
+          hints' <- forM hints $ \(p, is, as) -> do
+              p' <- resolvePath pos PTName p
+              as' <- mapM resolveAExpr as
+              return (p', is, as')
+          return $ CHash hints' i
       CAEnc -> return CAEnc
       CEncStAEAD p is -> do
           p' <- resolvePath pos PTCounter p
@@ -522,25 +547,28 @@ resolveExpr e =
           cop' <- resolveCryptOp (e^.spanOf) cop
           xs' <- mapM resolveAExpr xs
           return $ Spanned (e^.spanOf) $ ECrypt cop' xs'
-      EInput xk -> do
+      EInput s xk -> do
           (x, k) <- unbind xk
           k' <- resolveExpr k
-          return $ Spanned (e^.spanOf) $ EInput $ bind x k'
+          return $ Spanned (e^.spanOf) $ EInput s $ bind x k'
       EOutput a oe -> do
           a' <- resolveAExpr a
           oe' <- traverse (resolveEndpoint (e^.spanOf)) oe
           return $ Spanned (e^.spanOf) $ EOutput a' oe'
+      EBlock k -> do
+          k' <- resolveExpr k
+          return $ Spanned (e^.spanOf) $ EBlock k'
       ELet e1 ot anf s xk -> do
           e1' <- resolveExpr e1
           ot' <- traverse resolveTy ot
           (x, k) <- unbind xk
           k' <- resolveExpr k
           return $ Spanned (e^.spanOf) $ ELet e1' ot' anf s (bind x k')
-      EUnionCase a xk -> do
+      EUnionCase a s xk -> do
           a' <- resolveAExpr a
           (x, k) <- unbind xk
           k' <- resolveExpr k
-          return $ Spanned (e^.spanOf) $ EUnionCase a' (bind x k')
+          return $ Spanned (e^.spanOf) $ EUnionCase a' s (bind x k')
       EUnpack a xk -> do
           a' <- resolveAExpr a
           (x, k) <- unbind xk
@@ -552,6 +580,14 @@ resolveExpr e =
           k' <- resolveExpr k
           p' <- resolveProp p
           return $ Spanned (e^.spanOf) $ EChooseIdx (bind i' p') (bind i k')
+      EForallBV xpk -> do
+          (x, k) <- unbind xpk
+          k' <- resolveExpr k
+          return $ Spanned (e^.spanOf) $ EForallBV (bind x k') 
+      EForallIdx xpk -> do
+          (x, k) <- unbind xpk
+          k' <- resolveExpr k
+          return $ Spanned (e^.spanOf) $ EForallIdx (bind x k')
       EIf a e1 e2 -> do
           a' <- resolveAExpr a
           e1' <- resolveExpr e1
@@ -620,8 +656,9 @@ resolveDebugCommand dc =
       DebugPrintProp p -> DebugPrintProp <$> resolveProp p
       DebugPrintExpr e -> DebugPrintExpr <$> resolveExpr e
       DebugPrintLabel l -> DebugPrintLabel <$> resolveLabel l
+      DebugResolveANF a -> DebugResolveANF <$> resolveAExpr a
       DebugPrint _ -> return dc
-      DebugPrintTyContext -> return dc
+      DebugPrintTyContext _ -> return dc
       DebugPrintModules -> return dc
 
 
@@ -645,6 +682,10 @@ resolveProp p =
           as' <- mapM resolveAExpr as
           s' <- resolvePath (p^.spanOf) PTPredicate s
           return $ Spanned (p^.spanOf) $ PApp s' is as'
+      PAADOf ne a -> do
+          ne' <- resolveNameExp ne
+          a' <- resolveAExpr a
+          return $ Spanned (p^.spanOf) $ PAADOf ne' a'
       PLetIn a xp -> do
           a' <- resolveAExpr a
           (x, p) <- unbind xp
