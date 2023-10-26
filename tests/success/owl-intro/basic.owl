@@ -1,0 +1,31 @@
+locality client
+locality server
+
+name k1 : nonce @ server
+name k2 : nonce @ server
+
+enum SomeKey {
+    | K1 Name(k1)
+    | K2 Name(k2)
+}
+
+name kC : enckey SomeKey @ client, server
+
+enum CRequest {
+    | ReqK1
+    | ReqK2
+}
+
+def client_main(req : CRequest) @ client : Option(if sec(kC) then SomeKey else Data<adv>) = 
+    output req;
+    input ciphertext in
+    corr_case kC in
+    adec(get(kC), ciphertext)
+
+def server_main() @ server : Unit = 
+    input req in
+    let ciphertext = case req {
+        | ReqK1 => aenc(get(kC),K1(get(k1)))
+        | ReqK2 => aenc(get(kC),K2(get(k2)))
+    } in
+    output ciphertext

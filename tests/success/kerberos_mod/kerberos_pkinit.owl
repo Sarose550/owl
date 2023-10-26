@@ -16,6 +16,7 @@ module Kerberos_PKINIT(P : Params) : Kerberos_Stage1(P) = {
 
     // client's signing key; client signs her username
     // (TODO: client signs a timestamp and nonce)
+
     name sigkeyC : sigkey Name(P.uname) @ P.client
 
     // authserver signing key; authserver signs K
@@ -60,6 +61,8 @@ module Kerberos_PKINIT(P : Params) : Kerberos_Stage1(P) = {
     def client_pkinit (certC : Data<adv> ||signature||) @ P.client
         : Option client_stage1_t =
 
+        name signCNonce : nonce @ P.Client
+
 
         let vkCA = get_vk(sigkeyCA) in
 
@@ -67,7 +70,9 @@ module Kerberos_PKINIT(P : Params) : Kerberos_Stage1(P) = {
         let username = get(P.uname) in
 
         // sign username (TODO: sign a timestamp + nonce instead of username)
-        let signed_name = sign(get(sigkeyC), username) in
+
+        let timestamp : Data<adv> = { 0x1234 } in 
+        let signed_name = sign(concat(timestamp, get(signCNonce)), username) in
 
         // output = {{verkeyC}}_CA, verkeyC, {{username}}_sigkeyC, username
         let p = pkinit_client_to_authserver_msg(certC, get_vk(sigkeyC), signed_name, username) in
